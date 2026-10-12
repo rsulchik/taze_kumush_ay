@@ -10,6 +10,9 @@ on:
       - "arena/**"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -59,15 +62,46 @@ jobs:
       - name: Build web bundle (mobile)
         run: bun run mobile:web 2>&1 | tee -a build.log
 
+      - name: Verify web bundle has offline fixes
+        run: |
+          set -e
+          grep -rq "Сохранено локально" mobile/www/assets/*.js
+          grep -rq "Пропустить неудачные" mobile/www/assets/*.js
+          echo "офлайн-код присутствует в бандле" | tee -a build.log
+
       - name: Capacitor sync (android)
         run: bunx cap sync android 2>&1 | tee -a build.log
 
       - name: Build debug APK
         run: sh android/gradlew -p android assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
 
-      - name: Show APK
-        if: always()
-        run: ls -la android/app/build/outputs/apk/debug/ 2>&1 | tee -a build.log
+      - name: Verify APK contents
+        run: |
+          set -o pipefail
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$APK" | grep -q "AndroidManifest.xml"
+          unzip -l "$APK" | grep -q "assets/public/assets/index-"
+          unzip -p "$APK" assets/public/assets/index-*.js | grep -q "Сохранено локально"
+          ls -la android/app/build/outputs/apk/debug/ | tee -a build.log
+          sha256sum "$APK" | tee -a build.log
+
+      - name: Publish APK (tag apk-latest + release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          mkdir -p /tmp/apkpub && cp "$APK" /tmp/apkpub/kumushay-debug.apk
+          cd /tmp/apkpub
+          git init -q
+          git add kumushay-debug.apk
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "APK ${GITHUB_SHA::7}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/tags/apk-latest
+          cd "$GITHUB_WORKSPACE"
+          gh release view apk-latest > /dev/null 2>&1 \
+            && gh release upload apk-latest "$APK" --clobber \
+            || gh release create apk-latest "$APK" --title "Kumush_ay APK" --notes "Отладочная сборка из ветки ${GITHUB_REF_NAME}, коммит ${GITHUB_SHA::7}"
 
       - name: Upload build log
         if: always()
