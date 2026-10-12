@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
-import { loadLocalTransactions, saveLocalTransactions } from "@/lib/offline/local-db";
+import { loadLocalTransactions, saveLocalTransactions, applyPendingTransactionOps } from "@/lib/offline/local-db";
 import { deleteTransactionOfflineAware } from "@/lib/offline/mutations";
 import { isBrowserOnline } from "@/lib/offline/network";
 import { fmtMoney, fmtDate } from "@/lib/format";
@@ -50,7 +50,8 @@ function TxPage() {
           .order("created_at", { ascending: false })
           .limit(100);
         if (error) throw error;
-        const rows = data ?? [];
+        // Не отправленные офлайн операции остаются видимыми поверх ответа сервера.
+        const rows = await applyPendingTransactionOps(data ?? []);
         await saveLocalTransactions(rows);
         return rows;
       } catch (err) {
@@ -129,6 +130,11 @@ function TransactionRow({ transaction: t }: { transaction: any }) {
     <div className="flex flex-wrap items-center justify-between gap-3 py-3">
       <div className="min-w-0">
         <Badge variant="secondary">{label}</Badge>
+        {t._pending && (
+          <Badge variant="outline" className="ml-2 border-amber-500/40 text-[10px] text-amber-900 dark:text-amber-200">
+            не отправлено
+          </Badge>
+        )}
         <span className="ml-3 text-sm text-muted-foreground">{t.employee_name ?? "—"}</span>
         {t.notes && <p className="mt-1 truncate text-xs text-muted-foreground">{t.notes}</p>}
       </div>

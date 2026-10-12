@@ -12,4 +12,11 @@ export default defineConfig({
   tanstackStart: {
     server: { entry: "server" },
   },
+  vite: {
+    // Dev-сервер запускают и через прокси/превью-домены (в т.ч. в песочнице) —
+    // иначе Vite отвечает 403 «Blocked request».
+    server: {
+      allowedHosts: true,
+    },
+  },
 });
