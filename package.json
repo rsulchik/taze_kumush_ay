@@ -14,7 +14,8 @@
     "mobile:add": "cap add android",
     "mobile:sync": "bun run mobile:web && cap sync android",
     "mobile:open": "cap open android",
-    "mobile:apk": "bun run mobile:web && cap sync android && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1"
+    "mobile:apk": "bun run mobile:web && cap sync android && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1",
+    "test:offline": "node scripts/offline-smoke.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^7.4.2",

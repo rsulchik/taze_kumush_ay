@@ -175,6 +175,12 @@ function JewelryCard({ product: p }: { product: any }) {
         </div>
         <div className="font-mono text-xs text-muted-foreground">{p.sku}</div>
 
+        {p._pending && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-900 dark:text-amber-200">
+            Сохранено локально — отправится при связи
+          </div>
+        )}
+
         <div className="rounded-md border bg-muted/30 p-3 text-xs">
           <div className="mb-2 font-semibold uppercase tracking-wider text-muted-foreground">Harydyň pasporty</div>
           <Row label="В наличии" value={`${getProductStock(p)} шт.`} />

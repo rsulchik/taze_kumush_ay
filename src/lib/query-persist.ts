@@ -4,14 +4,13 @@ import { del, get, set } from "idb-keyval";
 
 const PERSIST_KEY = "kumush-query-cache-v1";
 
-const PERSISTABLE_QUERY_KEYS = new Set([
-  "products-full",
-  "products-gemstones",
-  "products-min",
-  "dashboard",
-  "transactions",
-  "categories",
-]);
+/**
+ * В персистентном кэше react-query держим только «лёгкие» списки.
+ * products-full / products-min / dashboard содержат фотографии как data URL —
+ * они и так лежат в IndexedDB (см. src/lib/offline/local-db.ts), а дублирование
+ * удваивало размер хранилища и каждую запись кэша.
+ */
+const PERSISTABLE_QUERY_KEYS = new Set(["products-gemstones", "categories", "transactions"]);
 
 /** Keep cached catalog/photos long enough for offline Capacitor APK use. */
 export const queryGcTimeMs = 1000 * 60 * 60 * 24 * 30;

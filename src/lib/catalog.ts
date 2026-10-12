@@ -1,8 +1,21 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { loadLocalProducts, mirrorCatalogToLocal, saveLocalCategories, saveLocalGemstones } from "@/lib/offline/local-db";
+import { enrichProductsWithCachedImages, onImagesCached } from "@/lib/offline/image-cache";
+import {
+  loadLocalProducts,
+  loadLocalProductsWithImages,
+  saveCatalogSnapshot,
+  saveLocalCategories,
+  saveLocalGemstones,
+  saveLocalProducts,
+} from "@/lib/offline/local-db";
 import { isBrowserOnline } from "@/lib/offline/network";
-import { detectStockColumn, isMissingColumnError } from "@/lib/product-stock";
+import { isTempId } from "@/lib/offline/queue";
+import {
+  detectStockColumn,
+  isMissingColumnError,
+  resetStockColumnProbe,
+} from "@/lib/product-stock";
 
 const PRODUCT_LIST_FIELDS =
   "id, title, sku, status, category_id, metal_type, assay, size, total_weight, metal_weight, cost_price, sale_price, description, created_at";
@@ -71,9 +84,58 @@ function attachCategories(products: any[], categoriesMap: Record<string, { name:
   }));
 }
 
+let imageMirrorRun: Promise<void> | null = null;
+let imageNotificationsStarted = false;
+
+/**
+ * Фото докачиваются в фоне. Раньше каталог ждал скачивания ВСЕХ фотографий
+ * (по одному запросу на снимок), поэтому на медленной сети список не появлялся минутами.
+ */
+export function mirrorImagesInBackground(queryClient: QueryClient | null, products: any[]): void {
+  if (imageMirrorRun || !isBrowserOnline()) return;
+
+  imageMirrorRun = (async () => {
+    try {
+      const enriched = await enrichProductsWithCachedImages(products, {
+        fetchMissing: true,
+        concurrency: 2,
+      });
+
+      const ids = new Set(enriched.map((p) => p.id));
+      const localOnly = ((await loadLocalProducts<any[]>()) ?? []).filter(
+        (p) => isTempId(p.id) && !ids.has(p.id),
+      );
+      await saveLocalProducts(localOnly.length ? [...localOnly, ...enriched] : enriched);
+
+      if (queryClient) {
+        startImageNotifications(queryClient);
+      }
+    } catch {
+      // Фоновое кэширование фото не должно ломать каталог.
+    } finally {
+      imageMirrorRun = null;
+    }
+  })();
+}
+
+/** Когда фото докачалось — подставить его в открытый список без перезагрузки. */
+function startImageNotifications(queryClient: QueryClient): void {
+  if (imageNotificationsStarted) return;
+  imageNotificationsStarted = true;
+
+  onImagesCached(() => {
+    const current = queryClient.getQueryData<any[]>(["products-full"]);
+    if (!current?.length) return;
+    void enrichProductsWithCachedImages(current, { fetchMissing: false }).then((next) => {
+      queryClient.setQueryData(["products-full"], next);
+      void saveLocalProducts(next);
+    });
+  });
+}
+
 export async function fetchProductsFull() {
   if (!isBrowserOnline()) {
-    const local = await loadLocalProducts<any[]>();
+    const local = await loadLocalProductsWithImages<any[]>();
     if (local?.length) return local;
     throw new Error("Нет сети и нет сохранённого каталога. Подключитесь к интернету один раз.");
   }
@@ -109,8 +171,8 @@ export async function fetchProductsFull() {
         }));
 
         const attached = attachCategories(withImages, categoriesMap);
-        // Cache photos as data URLs so APK works fully offline
-        return await mirrorCatalogToLocal(attached);
+        // Список отдаём сразу (фото — из локального кэша), остальное докачивается в фоне.
+        return await saveCatalogSnapshot(attached);
       } catch (error) {
         lastError = error;
         if (isMissingColumnError(error)) continue;
@@ -120,7 +182,7 @@ export async function fetchProductsFull() {
 
     throw lastError ?? new Error("Не удалось загрузить каталог.");
   } catch (error) {
-    const local = await loadLocalProducts<any[]>();
+    const local = await loadLocalProductsWithImages<any[]>();
     if (local?.length) return local;
     throw error;
   }
@@ -165,11 +227,18 @@ export async function fetchProductsGemstones(_queryClient: QueryClient) {
 }
 
 export async function prefetchCatalog(queryClient: QueryClient) {
+  startImageNotifications(queryClient);
+  resetStockColumnProbe();
+
   try {
     await queryClient.prefetchQuery({
       queryKey: ["products-full"],
       queryFn: fetchProductsFull,
     });
+    const products = queryClient.getQueryData<any[]>(["products-full"]);
+    if (products?.length) {
+      mirrorImagesInBackground(queryClient, products);
+    }
   } catch {
     // Keep showing persisted cache when the server is slow.
   }

@@ -17,19 +17,52 @@ export function isMissingColumnError(error: unknown, column?: string): boolean {
   return new RegExp(`\\b${column}\\b`, "i").test(message);
 }
 
+/** Схема могла измениться (применили миграцию) — перепроверяем колонку при следующем обращении. */
+export function resetStockColumnProbe(): void {
+  useQuantityColumn = null;
+}
+
 export async function detectStockColumn(): Promise<boolean> {
   if (useQuantityColumn !== null) return useQuantityColumn;
-  if (!isBrowserOnline()) {
-    useQuantityColumn = true;
-    return useQuantityColumn;
-  }
+
+  // Без сети проверить нельзя: делаем предположение, но НЕ запоминаем его,
+  // иначе после восстановления связи приложение будет писать в несуществующую колонку.
+  if (!isBrowserOnline()) return true;
+
   try {
     const { error } = await supabase.from("products").select("quantity").limit(1);
-    useQuantityColumn = !error;
+    if (!error) {
+      useQuantityColumn = true;
+    } else if (isMissingColumnError(error, "quantity")) {
+      useQuantityColumn = false;
+    } else {
+      // Таймаут/сеть/права — это не ответ про схему, оставляем определение на потом.
+      return true;
+    }
   } catch {
-    useQuantityColumn = true;
+    return true;
   }
+
   return useQuantityColumn;
+}
+
+/** Привести поле остатка к той колонке, которая реально есть в базе (для очереди, собранной офлайн). */
+export async function alignStockField<T extends Record<string, unknown>>(payload: T): Promise<T> {
+  const useQty = await detectStockColumn();
+  const next: Record<string, unknown> = { ...payload };
+
+  const qty = typeof next.quantity === "number" ? next.quantity : null;
+  const legacy = typeof next.price_per_gram === "number" ? next.price_per_gram : null;
+
+  if (useQty) {
+    if (qty == null && legacy != null) next.quantity = legacy;
+    delete next.price_per_gram;
+  } else {
+    if (legacy == null && qty != null) next.price_per_gram = qty;
+    delete next.quantity;
+  }
+
+  return next as T;
 }
 
 export function getStockSelectField(): "quantity" | "price_per_gram" | null {
@@ -79,7 +112,9 @@ export async function fetchProductsForPicker() {
   if (!isBrowserOnline()) {
     const local = await loadLocalProducts<any[]>();
     if (local?.length) {
-      return [...local].map(toPickerRow).sort((a, b) => String(a.title).localeCompare(String(b.title)));
+      return [...local]
+        .map(toPickerRow)
+        .sort((a, b) => String(a.title).localeCompare(String(b.title)));
     }
   }
 
@@ -90,7 +125,9 @@ export async function fetchProductsForPicker() {
   } catch (err) {
     const local = await loadLocalProducts<any[]>();
     if (local?.length) {
-      return [...local].map(toPickerRow).sort((a, b) => String(a.title).localeCompare(String(b.title)));
+      return [...local]
+        .map(toPickerRow)
+        .sort((a, b) => String(a.title).localeCompare(String(b.title)));
     }
     throw err;
   }

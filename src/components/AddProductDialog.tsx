@@ -49,8 +49,10 @@ type ProductRecord = {
   status: string;
   description?: string | null;
   image_url: string | null;
+  image_remote_url?: string | null;
   quantity?: number | null;
   price_per_gram?: number | null;
+  _pending?: boolean;
 };
 
 function productToForm(p: ProductRecord) {
@@ -138,7 +140,8 @@ function ProductFormDialog({ product, open: controlledOpen, onOpenChange, trigge
   useEffect(() => {
     if (open && product) {
       setForm(productToForm(product));
-      setInitialImageUrl(product.image_url);
+      // В кэше лежит data URL, а удалять на сервере нужно исходный файл Storage.
+      setInitialImageUrl(product.image_remote_url ?? product.image_url);
       setImagePreview(product.image_url);
       setImageFile(null);
       setNewCat("");

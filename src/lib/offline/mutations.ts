@@ -1,5 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
+import type { Database } from "@/integrations/supabase/types";
 import { putLocalImage, removeCachedImage } from "@/lib/offline/image-cache";
 import {
   applyLocalStockChange,
@@ -7,8 +8,8 @@ import {
   patchProductsCache,
   patchTransactionsCache,
 } from "@/lib/offline/local-db";
-import { isBrowserOnline } from "@/lib/offline/network";
-import { enqueue, isTempId, newOpId, newTempId } from "@/lib/offline/queue";
+import { isBrowserOnline, isNetworkError } from "@/lib/offline/network";
+import { enqueue, isTempId, newOpId, newTempId, removeOps } from "@/lib/offline/queue";
 import {
   compressImageToDataUrl,
   deleteProductImageFromStorage,
@@ -16,6 +17,11 @@ import {
 } from "@/lib/product-image";
 import { applyTransactionQuantity, revertTransactionQuantity } from "@/lib/product-quantity";
 import { stockInsertField, stockUpdateField } from "@/lib/product-stock";
+
+type ProductInsert = Database["public"]["Tables"]["products"]["Insert"];
+type ProductUpdate = Database["public"]["Tables"]["products"]["Update"];
+type TransactionInsert = Database["public"]["Tables"]["transactions"]["Insert"];
+type StockFields = { quantity?: number; price_per_gram?: number };
 
 async function fileToOfflineDataUrl(file: File): Promise<string> {
   const dataUrl = await compressImageToDataUrl(file, 1000, 0.78);
@@ -48,6 +54,23 @@ export type ProductSaveInput = {
   imagePreview: string | null;
 };
 
+/** Фото: онлайн — в Storage, офлайн (или если Storage недоступен) — data URL в базе. */
+async function resolveImageForSave(
+  file: File,
+): Promise<{ imageUrl: string | null; imageDataUrl: string | null }> {
+  if (isBrowserOnline()) {
+    try {
+      const uploaded = await resolveProductImageUrl(file, "product");
+      if (uploaded.startsWith("data:")) return { imageUrl: uploaded, imageDataUrl: uploaded };
+      return { imageUrl: uploaded, imageDataUrl: null };
+    } catch {
+      // сеть отпала или Storage не настроен — работаем как офлайн
+    }
+  }
+  const dataUrl = await fileToOfflineDataUrl(file);
+  return { imageUrl: dataUrl, imageDataUrl: dataUrl };
+}
+
 export async function saveProductOfflineAware(qc: QueryClient, input: ProductSaveInput) {
   const quantity = parseInt(input.form.quantity, 10);
   if (!Number.isFinite(quantity) || quantity < 0) {
@@ -58,26 +81,23 @@ export async function saveProductOfflineAware(qc: QueryClient, input: ProductSav
   }
 
   let image_url: string | null | undefined = undefined;
-  let imageDataUrl: string | null | undefined = undefined;
+  let imageDataUrl: string | null = null;
 
   if (input.imageFile) {
-    if (isBrowserOnline()) {
-      try {
-        image_url = await resolveProductImageUrl(input.imageFile, input.form.sku.trim());
-      } catch {
-        image_url = await fileToOfflineDataUrl(input.imageFile);
-      }
-    } else {
-      image_url = await fileToOfflineDataUrl(input.imageFile);
-      imageDataUrl = image_url;
-    }
+    const resolved = await resolveImageForSave(input.imageFile);
+    image_url = resolved.imageUrl;
+    imageDataUrl = resolved.imageDataUrl;
   } else if (input.isEdit && !input.imagePreview && input.initialImageUrl) {
     image_url = null;
   }
 
-  const stock = input.isEdit ? await stockUpdateField(quantity).catch(() => ({ quantity })) : await stockInsertField(quantity).catch(() => ({ quantity }));
+  const stock: StockFields = (
+    input.isEdit
+      ? await stockUpdateField(quantity).catch(() => ({ quantity }))
+      : await stockInsertField(quantity).catch(() => ({ quantity }))
+  ) as StockFields;
 
-  const payload: Record<string, unknown> = {
+  const payload: ProductInsert = {
     title: input.form.title.trim(),
     sku: input.form.sku.trim(),
     category_id: input.form.category_id || null,
@@ -94,35 +114,57 @@ export async function saveProductOfflineAware(qc: QueryClient, input: ProductSav
     ...(image_url !== undefined ? { image_url } : {}),
   };
 
-  const online = isBrowserOnline();
+  const canTryServer = isBrowserOnline() && !(input.isEdit && isTempId(input.productId));
 
   if (input.isEdit && input.productId) {
-    if (online && !isTempId(input.productId)) {
-      const { error } = await supabase.from("products").update(payload).eq("id", input.productId);
-      if (error) throw error;
-      if (image_url != null && input.initialImageUrl && image_url !== input.initialImageUrl) {
-        await deleteProductImageFromStorage(input.initialImageUrl);
+    if (canTryServer) {
+      const { error } = await supabase
+        .from("products")
+        .update(payload as ProductUpdate)
+        .eq("id", input.productId);
+      if (!error) {
+        if (
+          input.initialImageUrl &&
+          (image_url === null ||
+            (typeof image_url === "string" && image_url !== input.initialImageUrl))
+        ) {
+          await deleteProductImageFromStorage(input.initialImageUrl);
+        }
+        patchProductsCache(qc, (list) =>
+          list.map((p) => {
+            if (p.id !== input.productId) return p;
+            const next: any = { ...p, ...payload, _pending: false };
+            if (image_url !== undefined) next.image_url = image_url;
+            return next;
+          }),
+        );
+        if (typeof image_url === "string" && image_url.startsWith("data:")) {
+          await putLocalImage(input.productId, image_url);
+        }
+        if (image_url === null) await removeCachedImage(input.productId);
+        return { offline: false };
       }
-      if (image_url === null && input.initialImageUrl) {
-        await deleteProductImageFromStorage(input.initialImageUrl);
-      }
-    } else {
-      await enqueue({
-        id: newOpId(),
-        createdAt: new Date().toISOString(),
-        kind: "product.update",
-        productId: input.productId,
-        payload,
-        imageDataUrl: imageDataUrl ?? (typeof image_url === "string" && image_url.startsWith("data:") ? image_url : undefined),
-        clearImage: image_url === null,
-        previousImageUrl: input.initialImageUrl ?? null,
-      });
+      if (!isNetworkError(error)) throw error;
+      // связь пропала — сохраняем в очередь ниже
     }
+
+    await enqueue({
+      id: newOpId(),
+      createdAt: new Date().toISOString(),
+      kind: "product.update",
+      productId: input.productId,
+      payload: payload as Record<string, unknown>,
+      imageDataUrl:
+        imageDataUrl ??
+        (typeof image_url === "string" && image_url.startsWith("data:") ? image_url : undefined),
+      clearImage: image_url === null,
+      previousImageUrl: input.initialImageUrl ?? null,
+    });
 
     patchProductsCache(qc, (list) =>
       list.map((p) => {
         if (p.id !== input.productId) return p;
-        const next = { ...p, ...payload };
+        const next: any = { ...p, ...payload, _pending: true };
         if (image_url !== undefined) next.image_url = image_url;
         return next;
       }),
@@ -131,46 +173,49 @@ export async function saveProductOfflineAware(qc: QueryClient, input: ProductSav
       await putLocalImage(input.productId, image_url);
     }
     if (image_url === null) await removeCachedImage(input.productId);
-    return { offline: !online || isTempId(input.productId) };
+    return { offline: true };
   }
 
   // insert
-  const tempId = newTempId();
-  const insertPayload = {
-    ...payload,
-    image_url: image_url ?? null,
-  };
+  const insertPayload: ProductInsert = { ...payload, image_url: image_url ?? null };
 
-  if (online) {
-    const { data, error } = await supabase.from("products").insert(insertPayload).select("*").single();
-    if (error) throw error;
-    const row = {
-      ...data,
-      categories: null,
-    };
-    patchProductsCache(qc, (list) => [row, ...list]);
-    if (typeof data.image_url === "string" && data.image_url.startsWith("data:")) {
-      await putLocalImage(data.id, data.image_url);
+  if (canTryServer) {
+    const { data, error } = await supabase
+      .from("products")
+      .insert(insertPayload)
+      .select("*")
+      .single();
+    if (!error && data) {
+      patchProductsCache(qc, (list) => [{ ...data, categories: null, _pending: false }, ...list]);
+      if (typeof data.image_url === "string" && data.image_url.startsWith("data:")) {
+        await putLocalImage(data.id, data.image_url);
+      }
+      return { offline: false, id: data.id };
     }
-    return { offline: false, id: data.id };
+    if (error && !isNetworkError(error)) throw error;
   }
 
+  const tempId = newTempId();
   const localRow = {
     id: tempId,
     ...insertPayload,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     categories: null,
+    _pending: true,
   };
+
   await enqueue({
     id: newOpId(),
     createdAt: new Date().toISOString(),
     kind: "product.insert",
     tempId,
-    payload: insertPayload,
-    imageDataUrl: typeof insertPayload.image_url === "string" && insertPayload.image_url.startsWith("data:")
-      ? insertPayload.image_url
-      : imageDataUrl ?? null,
+    payload: insertPayload as Record<string, unknown>,
+    imageDataUrl:
+      imageDataUrl ??
+      (typeof insertPayload.image_url === "string" && insertPayload.image_url.startsWith("data:")
+        ? insertPayload.image_url
+        : null),
   });
   patchProductsCache(qc, (list) => [localRow, ...list]);
   if (typeof insertPayload.image_url === "string" && insertPayload.image_url.startsWith("data:")) {
@@ -184,13 +229,28 @@ export async function deleteProductOfflineAware(
   product: { id: string; image_url?: string | null; image_remote_url?: string | null },
 ) {
   const imageUrl = product.image_remote_url ?? product.image_url ?? null;
-  const online = isBrowserOnline() && !isTempId(product.id);
+  const localOnly = isTempId(product.id);
+  const canTryServer = isBrowserOnline() && !localOnly;
+  let sent = false;
 
-  if (online) {
-    await deleteProductImageFromStorage(imageUrl);
+  if (localOnly) {
+    // Товар ещё не был на сервере: убираем его из очереди, удалять нечего.
+    await removeOps(
+      (op) =>
+        (op.kind === "product.insert" && op.tempId === product.id) ||
+        (op.kind === "product.update" && op.productId === product.id),
+    );
+  } else if (canTryServer) {
     const { error } = await supabase.from("products").delete().eq("id", product.id);
-    if (error) throw error;
-  } else {
+    if (!error) {
+      sent = true;
+      await deleteProductImageFromStorage(imageUrl);
+    } else if (!isNetworkError(error)) {
+      throw error;
+    }
+  }
+
+  if (!localOnly && !sent) {
     await enqueue({
       id: newOpId(),
       createdAt: new Date().toISOString(),
@@ -202,19 +262,23 @@ export async function deleteProductOfflineAware(
 
   patchProductsCache(qc, (list) => list.filter((p) => p.id !== product.id));
   await removeCachedImage(product.id);
-  return { offline: !online };
+  return { offline: !sent };
 }
 
 export async function addCategoryOfflineAware(qc: QueryClient, name: string) {
   if (isBrowserOnline()) {
     const { data, error } = await supabase.from("categories").insert({ name }).select().single();
-    if (error) throw error;
-    patchCategoriesCache(qc, (list) => [...list, data].sort((a, b) => a.name.localeCompare(b.name)));
-    return { offline: false, category: data };
+    if (!error && data) {
+      patchCategoriesCache(qc, (list) =>
+        [...list, data].sort((a, b) => a.name.localeCompare(b.name)),
+      );
+      return { offline: false, category: data };
+    }
+    if (error && !isNetworkError(error)) throw error;
   }
 
   const tempId = newTempId();
-  const cat = { id: tempId, name, created_at: new Date().toISOString() };
+  const cat = { id: tempId, name, created_at: new Date().toISOString(), _pending: true };
   await enqueue({
     id: newOpId(),
     createdAt: new Date().toISOString(),
@@ -236,7 +300,7 @@ export async function saveTransactionOfflineAware(
     notes: string;
   },
 ) {
-  const payload = {
+  const payload: TransactionInsert = {
     product_id: form.product_id || null,
     type: form.type,
     final_price: parseFloat(form.final_price),
@@ -244,23 +308,26 @@ export async function saveTransactionOfflineAware(
     notes: form.notes || null,
   };
 
-  const online = isBrowserOnline() && !(form.product_id && isTempId(form.product_id));
+  const canTryServer = isBrowserOnline() && !(form.product_id && isTempId(form.product_id));
 
-  if (online) {
-    const { error } = await supabase.from("transactions").insert(payload);
-    if (error) throw error;
-    if (form.product_id) await applyTransactionQuantity(form.product_id, form.type);
-    applyLocalStockChange(qc, form.product_id, form.type, "apply");
-    // refresh list from server on next invalidate; also optimistic prepend
-    patchTransactionsCache(qc, (list) => [
-      {
-        id: crypto.randomUUID(),
-        ...payload,
-        created_at: new Date().toISOString(),
-      },
-      ...list,
-    ]);
-    return { offline: false };
+  if (canTryServer) {
+    const { data, error } = await supabase
+      .from("transactions")
+      .insert(payload)
+      .select("id")
+      .single();
+    if (!error && data) {
+      if (form.product_id) {
+        await applyTransactionQuantity(form.product_id, form.type).catch(() => undefined);
+        applyLocalStockChange(qc, form.product_id, form.type, "apply");
+      }
+      patchTransactionsCache(qc, (list) => [
+        { id: data.id, ...payload, created_at: new Date().toISOString() },
+        ...list,
+      ]);
+      return { offline: false };
+    }
+    if (error && !isNetworkError(error)) throw error;
   }
 
   const tempId = newTempId();
@@ -269,7 +336,14 @@ export async function saveTransactionOfflineAware(
     createdAt: new Date().toISOString(),
     kind: "transaction.insert",
     tempId,
-    payload: { ...payload, created_at: new Date().toISOString() },
+    payload: {
+      product_id: payload.product_id ?? null,
+      type: payload.type,
+      final_price: payload.final_price,
+      employee_name: payload.employee_name ?? null,
+      notes: payload.notes ?? null,
+      created_at: new Date().toISOString(),
+    },
   });
   patchTransactionsCache(qc, (list) => [
     {
@@ -288,13 +362,25 @@ export async function deleteTransactionOfflineAware(
   qc: QueryClient,
   tx: { id: string; product_id: string | null; type: string },
 ) {
-  const online = isBrowserOnline() && !isTempId(tx.id);
+  const localOnly = isTempId(tx.id);
+  const canTryServer = isBrowserOnline() && !localOnly;
+  let sent = false;
 
-  if (online) {
+  if (localOnly) {
+    await removeOps((op) => op.kind === "transaction.insert" && op.tempId === tx.id);
+  } else if (canTryServer) {
     const { error } = await supabase.from("transactions").delete().eq("id", tx.id);
-    if (error) throw error;
-    if (tx.product_id) await revertTransactionQuantity(tx.product_id, tx.type);
-  } else {
+    if (!error) {
+      sent = true;
+      if (tx.product_id) {
+        await revertTransactionQuantity(tx.product_id, tx.type).catch(() => undefined);
+      }
+    } else if (!isNetworkError(error)) {
+      throw error;
+    }
+  }
+
+  if (!localOnly && !sent) {
     await enqueue({
       id: newOpId(),
       createdAt: new Date().toISOString(),
@@ -307,5 +393,5 @@ export async function deleteTransactionOfflineAware(
 
   patchTransactionsCache(qc, (list) => list.filter((t) => t.id !== tx.id));
   if (tx.product_id) applyLocalStockChange(qc, tx.product_id, tx.type, "revert");
-  return { offline: !online };
+  return { offline: !sent };
 }
