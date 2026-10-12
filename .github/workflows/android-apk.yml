@@ -1,0 +1,57 @@
+name: Android APK (debug)
+
+# Сборка отладочного APK: web-бандл (Capacitor) → Gradle assembleDebug.
+# Запускается на push в рабочую ветку или вручную (Actions → Run workflow).
+# Готовый файл лежит в артефакте kumushay-debug-apk.
+
+on:
+  push:
+    branches:
+      - "arena/**"
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Install JS dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build web bundle (mobile)
+        run: bun run mobile:web
+
+      - name: Capacitor sync (android)
+        run: bunx cap sync android
+
+      - name: Build debug APK
+        run: sh android/gradlew -p android assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kumushay-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
