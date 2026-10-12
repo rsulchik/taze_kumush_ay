@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Kumush_ay</string>
+    <string name="title_activity_main">Kumush_ay</string>
+    <string name="package_name">com.kumushay.inventory</string>
+    <string name="custom_url_scheme">com.kumushay.inventory</string>
+</resources>
